@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""
+memebot.py — trending memecoin digest bot.
+
+Pulls from three free, no-key sources:
+  1. DexScreener  — boosted/trending on-chain tokens (price, volume, chain)
+  2. CoinGecko    — official "trending" search list
+  3. Reddit       — r/CryptoMoonShots + r/SatoshiStreetBets hot posts (social buzz)
+
+Combines them into a ranked digest and either:
+  - posts it to X (Twitter) if X_API_KEY / X_API_SECRET / X_ACCESS_TOKEN /
+    X_ACCESS_SECRET are set in the environment (needs a paid X API tier
+    with write access), or
+  - writes a dated draft .txt (ready to copy-paste) into ./drafts/ and
+    prints it to stdout.
+
+Usage:
+  python3 memebot.py --once          # run a single cycle and exit
+  python3 memebot.py                 # run forever, one cycle every
+                                      # MEMEBOT_INTERVAL_MINUTES (default 60)
+
+Config (env vars, all optional):
+  MEMEBOT_INTERVAL_MINUTES   polling interval in minutes (default: 60)
+  X_API_KEY / X_API_SECRET / X_ACCESS_TOKEN / X_ACCESS_SECRET
+                              X (Twitter) credentials for posting.
+                              If absent, the bot runs in draft-only mode.
+"""
+
+import os
+import sys
+import time
+import json
+import argparse
+import datetime
+import urllib.request
+import urllib.error
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+INTERVAL_MINUTES = int(os.environ.get("MEMEBOT_INTERVAL_MINUTES", "60"))
+DRAFTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drafts")
+USER_AGENT = "memebot/1.0 (personal trending-memecoin digest script)"
+TWEET_LIMIT = 280
+
+# Known meme-ish ticker hints, used only to bias relevance when scanning
+# Reddit post titles for the "social buzz" pass. Not exhaustive.
+MEME_HINTS = ["doge", "pepe", "shib", "bonk", "wif", "floki", "meme", "inu", "cat", "moon"]
+
+
+# --------------------------------------------------------------------------
+# Data sources
+# --------------------------------------------------------------------------
+
+def _get_json(url, timeout=12):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def fetch_dexscreener_trending(limit=6):
+    """Latest boosted/trending tokens on DexScreener (on-chain, free, no key)."""
+    out = []
+    try:
+        data = _get_json("https://api.dexscreener.com/token-boosts/top/v1")
+        for item in data[:limit]:
+            chain = item.get("chainId", "?")
+            addr = item.get("tokenAddress", "")
+            url = item.get("url") or f"https://dexscreener.com/{chain}/{addr}"
+            desc = (item.get("description") or "").strip().replace("\n", " ")
+            out.append({
+                "source": "DexScreener",
+                "name": desc[:60] if desc else addr[:10],
+                "chain": chain,
+                "url": url,
+            })
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as e:
+        print(f"[warn] DexScreener fetch failed: {e}", file=sys.stderr)
+    return out
+
+
+def fetch_coingecko_trending(limit=6):
+    """CoinGecko's official trending-coins list (free, no key)."""
+    out = []
+    try:
+        data = _get_json("https://api.coingecko.com/api/v3/search/trending")
+        for item in data.get("coins", [])[:limit]:
+            c = item.get("item", {})
+            out.append({
+                "source": "CoinGecko",
+                "name": f"{c.get('name', '?')} ({c.get('symbol', '?').upper()})",
+                "rank": c.get("market_cap_rank"),
+                "url": f"https://www.coingecko.com/en/coins/{c.get('id', '')}",
+            })
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as e:
+        print(f"[warn] CoinGecko fetch failed: {e}", file=sys.stderr)
+    return out
+
+
+def fetch_reddit_buzz(limit=6):
+    """Hot posts from meme-coin-heavy subreddits, filtered to meme-ish titles."""
+    out = []
+    subs = ["CryptoMoonShots", "SatoshiStreetBets"]
+    for sub in subs:
+        try:
+            data = _get_json(f"https://www.reddit.com/r/{sub}/hot.json?limit=25")
+            for child in data.get("data", {}).get("children", []):
+                p = child.get("data", {})
+                title = p.get("title", "")
+                low = title.lower()
+                if any(h in low for h in MEME_HINTS):
+                    out.append({
+                        "source": f"r/{sub}",
+                        "name": title[:80],
+                        "score": p.get("score", 0),
+                        "url": f"https://reddit.com{p.get('permalink', '')}",
+                    })
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as e:
+            print(f"[warn] Reddit fetch failed for r/{sub}: {e}", file=sys.stderr)
+    out.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return out[:limit]
+
+
+# --------------------------------------------------------------------------
+# Digest building
+# --------------------------------------------------------------------------
+
+def build_digest(dex, gecko, reddit):
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"🔥 Trending memecoins — {now}", ""]
+
+    if gecko:
+        lines.append("📈 CoinGecko trending:")
+        for c in gecko[:5]:
+            lines.append(f"  • {c['name']}")
+        lines.append("")
+
+    if dex:
+        lines.append("🧪 On-chain buzz (DexScreener):")
+        for d in dex[:5]:
+            lines.append(f"  • {d['name']} [{d['chain']}]")
+        lines.append("")
+
+    if reddit:
+        lines.append("💬 Social buzz (Reddit):")
+        for r in reddit[:5]:
+            lines.append(f"  • {r['name']} ({r['source']}, {r['score']} pts)")
+        lines.append("")
+
+    if len(lines) == 2:
+        lines.append("No trending data available this cycle.")
+
+    return "\n".join(lines).strip()
+
+
+def build_tweet_thread(dex, gecko, reddit):
+    """Split the digest into tweet-sized (<=280 char) chunks for a thread."""
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    tweets = []
+
+    header = f"🔥 Trending memecoins — {now} 🧵"
+    tweets.append(header)
+
+    if gecko:
+        body = "📈 CoinGecko trending:\n" + "\n".join(f"• {c['name']}" for c in gecko[:5])
+        tweets.append(body[:TWEET_LIMIT])
+
+    if dex:
+        body = "🧪 On-chain buzz:\n" + "\n".join(f"• {d['name']} [{d['chain']}]" for d in dex[:5])
+        tweets.append(body[:TWEET_LIMIT])
+
+    if reddit:
+        body = "💬 Social buzz:\n" + "\n".join(f"• {r['name'][:50]}" for r in reddit[:4])
+        tweets.append(body[:TWEET_LIMIT])
+
+    if len(tweets) == 1:
+        tweets.append("No trending data available this cycle.")
+
+    return tweets
+
+
+# --------------------------------------------------------------------------
+# Posting
+# --------------------------------------------------------------------------
+
+def x_credentials_present():
+    keys = ["X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET"]
+    return all(os.environ.get(k) for k in keys)
+
+
+def post_thread_to_x(tweets):
+    """Posts a thread via tweepy. Requires X API write access (paid tier)."""
+    try:
+        import tweepy
+    except ImportError:
+        print("[error] tweepy not installed. Run: pip install tweepy --break-system-packages", file=sys.stderr)
+        return False
+
+    client = tweepy.Client(
+        consumer_key=os.environ["X_API_KEY"],
+        consumer_secret=os.environ["X_API_SECRET"],
+        access_token=os.environ["X_ACCESS_TOKEN"],
+        access_token_secret=os.environ["X_ACCESS_SECRET"],
+    )
+
+    prev_id = None
+    try:
+        for text in tweets:
+            resp = client.create_tweet(text=text, in_reply_to_tweet_id=prev_id)
+            prev_id = resp.data["id"]
+        print(f"[ok] Posted thread of {len(tweets)} tweets to X.")
+        return True
+    except Exception as e:
+        print(f"[error] Posting to X failed: {e}", file=sys.stderr)
+        return False
+
+
+def save_draft(tweets, digest):
+    os.makedirs(DRAFTS_DIR, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(DRAFTS_DIR, f"draft_{stamp}.txt")
+    with open(path, "w") as f:
+        f.write("=== Full digest ===\n")
+        f.write(digest + "\n\n")
+        f.write("=== Tweet thread (copy-paste ready) ===\n")
+        for i, t in enumerate(tweets, 1):
+            f.write(f"\n--- Tweet {i}/{len(tweets)} ({len(t)} chars) ---\n{t}\n")
+    return path
+
+
+# --------------------------------------------------------------------------
+# Main cycle
+# --------------------------------------------------------------------------
+
+def run_once():
+    print(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] Fetching trending memecoin data...")
+    dex = fetch_dexscreener_trending()
+    gecko = fetch_coingecko_trending()
+    reddit = fetch_reddit_buzz()
+
+    digest = build_digest(dex, gecko, reddit)
+    tweets = build_tweet_thread(dex, gecko, reddit)
+
+    print("\n" + digest + "\n")
+
+    if x_credentials_present():
+        post_thread_to_x(tweets)
+    else:
+        path = save_draft(tweets, digest)
+        print(f"[info] No X API credentials found — saved draft instead:\n  {path}")
+        print("[info] To enable auto-posting, set X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Trending memecoin digest / X bot")
+    parser.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    args = parser.parse_args()
+
+    if args.once:
+        run_once()
+        return
+
+    print(f"Starting memebot — polling every {INTERVAL_MINUTES} min. Ctrl+C to stop.")
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            print(f"[error] Cycle failed: {e}", file=sys.stderr)
+        time.sleep(INTERVAL_MINUTES * 60)
+
+
+if __name__ == "__main__":
+    main()
